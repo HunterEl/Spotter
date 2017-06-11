@@ -11,7 +11,10 @@ $(BINARY):
 	go build ${LDFLAGS} -o ${BINARY} spotter.go
 
 install:
-	go install ${LDFLAGS} ./*.go 
+	go install ${LDFLAGS} ./*.go
+
+builddocker:
+	docker build -t hunterel/spotter .
 
 clean:
 	if [ -f ${BINARY} ] ; then rm ${BINARY} ; fi
