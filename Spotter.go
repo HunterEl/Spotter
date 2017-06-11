@@ -40,11 +40,13 @@ type Result struct {
 	success       int64
 	networkFailed int64
 	badFailed     int64
+	timedOut      int64
 	// more variables to follow
 }
 
 type Output struct {
 	category string
+	timedOut bool
 	respBody string
 }
 
@@ -69,6 +71,7 @@ var (
 	outputFile     string
 	requestHeaders headers
 	displayVersion bool
+	requestTimeout time.Duration
 	version        = "dev" // replace during make with -ldflags
 	build          = "dev" // replace during make with -ldflags
 )
@@ -81,6 +84,7 @@ func init() {
 	flag.StringVar(&outputFile, "o", "", "The Output File Location")
 	flag.Var(&requestHeaders, "h", "The Request Headers")
 	flag.BoolVar(&displayVersion, "v", false, "Version")
+	flag.DurationVar(&requestTimeout, "t", 0, "Timeout Per Request")
 	flag.Usage = usage
 }
 
@@ -126,6 +130,7 @@ func main() {
 
 	httpClient := &http.Client{
 		Transport: transport,
+		Timeout:   requestTimeout * time.Second,
 	}
 
 	bufferedChan := make(chan *Output, requests*int64(clients))
@@ -196,10 +201,19 @@ var transport = &http.Transport{
 func bench(conf *Configuration, result *Result, barrier *sync.WaitGroup) {
 	for result.requests < conf.requests {
 
+		start := time.Now()
 		resp, err := conf.client.Do(conf.request)
+		ms := int64(time.Since(start) / time.Millisecond)
+
+		timedOut := false
+		if ms >= 120000 {
+			log.Println("FUCK: Request exceeded 2 minutes!!!")
+			timedOut = true
+		}
+
 		result.requests++
 		if err != nil {
-			conf.resultBuffer <- &Output{"net", err.Error()}
+			conf.resultBuffer <- &Output{"net", timedOut, err.Error()}
 			continue
 		}
 
@@ -210,9 +224,9 @@ func bench(conf *Configuration, result *Result, barrier *sync.WaitGroup) {
 
 		statusCode := resp.StatusCode
 		if statusCode == 200 {
-			conf.resultBuffer <- &Output{"succ", string(bodyBytes)}
+			conf.resultBuffer <- &Output{"succ", timedOut, string(bodyBytes)}
 		} else {
-			conf.resultBuffer <- &Output{"bad", string(bodyBytes)}
+			conf.resultBuffer <- &Output{"bad", timedOut, string(bodyBytes)}
 		}
 	}
 
