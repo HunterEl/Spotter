@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,13 +42,10 @@ type Result struct {
 	success       int64
 	networkFailed int64
 	badFailed     int64
-	timedOut      int64
-	// more variables to follow
 }
 
 type Output struct {
 	category string
-	timedOut bool
 	respBody string
 }
 
@@ -64,27 +63,45 @@ type Configuration struct {
 }
 
 var (
-	requests       int64
-	clients        int
-	requestMethod  string
-	requestBody    string
-	outputFile     string
-	requestHeaders headers
-	displayVersion bool
-	requestTimeout time.Duration
-	version        = "dev" // replace during make with -ldflags
-	build          = "dev" // replace during make with -ldflags
+	requests        int64
+	clients         int
+	requestMethod   string
+	requestBody     string
+	outputFile      string
+	requestHeaders  headers
+	displayVersion  bool
+	requestTimeout  time.Duration
+	redirects       int
+	devLogger       bool
+	obnoxiousHeader bool
+	version         = "dev" // replace during make with -ldflags
+	build           = "dev" // replace during make with -ldflags
+)
+
+const (
+	GunShow               = "\U0001f4aa"
+	DefaultRequestTimeout = 30 * time.Second
+	DefaultRedirects      = 10
+	ObnoxiousHeader       = `
+ ______     ______   ______     ______   ______   ______     ______
+/\  ___\   /\  == \ /\  __ \   /\__  _\ /\__  _\ /\  ___\   /\  == \
+\ \___  \  \ \  _-/ \ \ \/\ \  \/_/\ \/ \/_/\ \/ \ \  __\   \ \  __<
+ \/\_____\  \ \_\    \ \_____\    \ \_\    \ \_\  \ \_____\  \ \_\ \_\
+  \/_____/   \/_/     \/_____/     \/_/     \/_/   \/_____/   \/_/ /_/`
 )
 
 func init() {
-	flag.Int64Var(&requests, "n", 1, "Number of requests")
-	flag.IntVar(&clients, "c", 1, "Number of workers")
-	flag.StringVar(&requestMethod, "r", "GET", "HTTP Request Type")
-	flag.StringVar(&requestBody, "d", "", "The Request Data")
-	flag.StringVar(&outputFile, "o", "", "The Output File Location")
-	flag.Var(&requestHeaders, "h", "The Request Headers")
-	flag.BoolVar(&displayVersion, "v", false, "Version")
-	flag.DurationVar(&requestTimeout, "t", 0, "Timeout Per Request")
+	flag.Int64Var(&requests, "requests", 1, "Number of requests")
+	flag.IntVar(&clients, "clients", 1, "Number of workers")
+	flag.StringVar(&requestMethod, "type", "GET", "HTTP Request Type")
+	flag.StringVar(&requestBody, "data", "", "The Request Data")
+	flag.StringVar(&outputFile, "output", "", "The Output File Location")
+	flag.Var(&requestHeaders, "header", "The Request Headers")
+	flag.BoolVar(&displayVersion, "version", false, "Version")
+	flag.DurationVar(&requestTimeout, "reqTimeout", DefaultRequestTimeout, "Timeout Per Request")
+	flag.IntVar(&redirects, "redirects", DefaultRedirects, "Number of redirects to allow. -1 means no follow.")
+	flag.BoolVar(&devLogger, "dev", false, "Logging internals for dev use")
+	flag.BoolVar(&obnoxiousHeader, "oh", false, "Displays a reallllly obnoxious header.(Please don't use this)")
 	flag.Usage = usage
 }
 
@@ -92,8 +109,12 @@ func main() {
 	flag.Parse()
 
 	if displayVersion {
-		fmt.Printf("Version: %s\nBuild: %s\n", version, build)
+		fmt.Printf("[SPOTTER]:\nVersion: %s\nBuild: %s\n", version, build)
 		os.Exit(0)
+	}
+
+	if obnoxiousHeader {
+		fmt.Println(ObnoxiousHeader)
 	}
 
 	args := flag.Args()
@@ -103,34 +124,73 @@ func main() {
 	}
 
 	urlDirty := args[0]
-	urlClean := checkURL(urlDirty)
+	if !strings.Contains(urlDirty, "://") && !strings.HasPrefix(urlDirty, "//") {
+		logMeUpFam("Adding // to input url")
+		urlDirty = "//" + urlDirty
+	}
+
+	urlClean, err := url.Parse(urlDirty)
+	if err != nil {
+		fmt.Printf("[SPOTTER]: Could not parse URL %q: %v", urlDirty, err)
+		os.Exit(1)
+	}
 
 	httpRequest := createHttpRequest(requestMethod, requestBody, requestHeaders, urlClean)
 
-	// This is where the magic happens...
-	fmt.Printf("Starting Benchmark with %d clients and %d requests per client\n", clients, requests)
+	fmt.Printf("[SPOTTER]: Starting tests with %d clients and %d requests per client\n", clients, requests)
 
 	start := time.Now()
 	var barrier sync.WaitGroup
-	results := make(map[int]*Result)
 	sigChannel := make(chan os.Signal, 2)
 	signal.Notify(sigChannel, os.Interrupt)
 
 	go func() {
 		_ = <-sigChannel
-		// print
+		fmt.Println("[SPOTTER]: Exiting on interrupt...")
 		os.Exit(0)
 	}()
 
-	// Set the number of CPUs if it's not set in the environment.
-	goMaxProcs := os.Getenv("GOMAXPROCS")
-	if goMaxProcs == "" {
+	maxProcs := os.Getenv("GOMAXPROCS")
+	if maxProcs == "" {
 		runtime.GOMAXPROCS(runtime.NumCPU())
+	}
+
+	defaultLocalAddr := net.IPAddr{
+		IP: net.IPv4zero,
+	}
+
+	defaultTLSConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+
+	dialer := &net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: defaultLocalAddr.IP, Zone: defaultLocalAddr.Zone},
+		KeepAlive: 30 * time.Second,
+		Timeout:   requestTimeout,
+	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		Dial:  dialer.Dial,
+		ResponseHeaderTimeout: requestTimeout,
+		TLSClientConfig:       defaultTLSConfig,
+		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConnsPerHost:   10000, // this should be a variable :thinking_face:
 	}
 
 	httpClient := &http.Client{
 		Transport: transport,
-		Timeout:   requestTimeout * time.Second,
+	}
+
+	httpClient.CheckRedirect = func(req *http.Request, reqList []*http.Request) error {
+		switch {
+		case redirects == -1:
+			return http.ErrUseLastResponse
+		case len(reqList) > redirects:
+			return fmt.Errorf("[SPOTTER]: Followed %d redirects. Stopping...", redirects)
+		default:
+			return nil
+		}
 	}
 
 	bufferedChan := make(chan *Output, requests*int64(clients))
@@ -144,9 +204,8 @@ func main() {
 
 	barrier.Add(clients)
 	for i := 0; i < clients; i++ {
-		result := &Result{}
-		results[i] = result
-		go bench(config, result, &barrier)
+		logMeUpFam(fmt.Sprintf("Starting client: %d", i))
+		go bench(config, &barrier, i)
 	}
 
 	total := 0
@@ -154,7 +213,9 @@ func main() {
 	badFailed := 0
 	succ := 0
 	file := &ResultFile{}
-	fmt.Printf("Waiting for %d clients to finish...\n", clients)
+
+	fmt.Println("[SPOTTER]: Drum roll please...")
+	logMeUpFam(fmt.Sprintf("Waiting for %d clients to finish...\n", clients))
 	barrier.Wait()
 	elapsed := float64(time.Since(start).Seconds())
 	close(bufferedChan)
@@ -177,61 +238,68 @@ func main() {
 	if outputFile != "" {
 		stats, err := json.Marshal(file)
 		if err != nil {
-			fmt.Println("ERROR MARSHALLING JSON: ", err)
+			fmt.Println("[SPOTTER]: Error Marshalling JSON: ", err)
 		}
 		err = writeOutputFile(outputFile, stats)
 		if err != nil {
-			fmt.Println("Couldn't write file: ", err)
+			fmt.Println("[SPOTTER]: Couldn't Write Output File: ", err)
 		}
 	}
 
-	fmt.Printf("\nRequest Number: %d\nSuccessful: %d\nNetwork Failed: %d\nBad Failed: %d\nRequests Per Second: %10f", total, succ, netFailed, badFailed, float64(total)/elapsed)
-	fmt.Printf("\nProgram took: %10f second(s)\n", elapsed)
+	fmt.Println("RESULTS:")
+	fmt.Printf("- Request Number: %d\n", total)
+	fmt.Printf("- Successful: %d\n", succ)
+	fmt.Printf("- Network Failed: %d\n", netFailed)
+	fmt.Printf("- Bad Failed: %d\n", badFailed)
+	fmt.Printf("- Requests Per Second: %10f\n", float64(total)/elapsed)
+	fmt.Printf("- Program took: %10f second(s)\n", elapsed)
 }
 
-// Can Configure SSL and redirect policy later.
-var transport = &http.Transport{
-	Proxy:                 http.ProxyFromEnvironment,
-	MaxIdleConns:          100,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   10 * time.Second,
-	ExpectContinueTimeout: 1 * time.Second,
+func flexItOut(hunkLevel int) {
+	f := bufio.NewWriter(os.Stdout)
+	defer f.Flush()
+	var b []byte
+	for i := 0; i < hunkLevel; i++ {
+		b = append(b, GunShow...)
+		b = append(b, ' ')
+	}
+	f.Write(b)
 }
 
-func bench(conf *Configuration, result *Result, barrier *sync.WaitGroup) {
-	for result.requests < conf.requests {
+func bench(conf *Configuration, barrier *sync.WaitGroup, id int) {
+	defer barrier.Done()
+	for i := int64(1); i <= conf.requests; i++ {
+		logMeUpFam(fmt.Sprintf("Client %d making request %d", id, i))
+		conf.resultBuffer <- crunchRequest(conf)
+	}
+}
 
-		start := time.Now()
-		resp, err := conf.client.Do(conf.request)
-		ms := int64(time.Since(start) / time.Millisecond)
+func logMeUpFam(logMsg string) {
+	if devLogger {
+		log.Println(logMsg)
+	}
+}
 
-		timedOut := false
-		if ms >= 120000 {
-			log.Println("FUCK: Request exceeded 2 minutes!!!")
-			timedOut = true
-		}
-
-		result.requests++
-		if err != nil {
-			conf.resultBuffer <- &Output{"net", timedOut, err.Error()}
-			continue
-		}
-
-		bodyBytes, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Println("ERROR: ", err.Error())
-		}
-
-		statusCode := resp.StatusCode
-		if statusCode == 200 {
-			conf.resultBuffer <- &Output{"succ", timedOut, string(bodyBytes)}
-		} else {
-			conf.resultBuffer <- &Output{"bad", timedOut, string(bodyBytes)}
-		}
+func crunchRequest(conf *Configuration) *Output {
+	resp, err := conf.client.Do(conf.request)
+	if err != nil {
+		return &Output{"net", err.Error()}
 	}
 
-	// Treating like thread barrier in Java.
-	barrier.Done()
+	defer resp.Body.Close()
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		logMeUpFam("Error reading body of the response!")
+		return &Output{"bad", err.Error()}
+	}
+
+	statusCode := resp.StatusCode
+
+	if statusCode >= 200 && statusCode < 300 {
+		return &Output{"succ", string(bodyBytes)}
+	} else {
+		return &Output{"bad", string(bodyBytes)}
+	}
 }
 
 func usage() {
@@ -239,33 +307,14 @@ func usage() {
 	flag.PrintDefaults()
 }
 
-func checkURL(uri string) *url.URL {
-	if !strings.Contains(uri, "://") && !strings.HasPrefix(uri, "//") {
-		uri = "//" + uri
-	}
-
-	url, error := url.Parse(uri)
-	if error != nil {
-		log.Fatalf("Could not parse url %q: %v", url, error)
-	}
-
-	if url.Scheme == "" {
-		fmt.Println("Could not find URL scheme! Using HTTP.")
-		url.Scheme = "http"
-	}
-
-	return url
-}
-
 func createHttpBody(body string) io.Reader {
-	/// Body could be a file. E.G. -> "@relativePathToFile"
 	if strings.HasPrefix(body, "@") {
 		fileName := body[1:]
 		file, err := os.Open(fileName)
 		if err != nil {
-			log.Fatalf("Could not read from File %s %v", fileName, err)
+			log.Fatalf("[SPOTTER]: Could not read from File %s %v", fileName, err)
 		}
-		// os.File implments "Read" so it can be an io.Reader
+		// os.File implements "Read" so it can be an io.Reader
 		return file
 	}
 	return strings.NewReader(body)
@@ -274,15 +323,15 @@ func createHttpBody(body string) io.Reader {
 func writeOutputFile(location string, body []byte) error {
 	_, err := os.Stat(location)
 	if err == nil {
-		fmt.Printf("\nFile %s Exists!\n", location)
+		fmt.Printf("\n[SPOTTER]: File %s Exists!\n", location)
 		scanner := bufio.NewScanner(os.Stdin)
 		var text string
 		for {
-			fmt.Println("Overwrite file? (y/n): ")
+			fmt.Print("[SPOTTER]: Overwrite file? (y/n): ")
 			scanner.Scan()
 			text = scanner.Text()
 			if strings.EqualFold(text, "n") {
-				fmt.Println("Exiting!")
+				fmt.Println("[SPOTTER]: Exiting since you are being difficult...")
 				os.Exit(1)
 			} else if strings.EqualFold(text, "y") {
 				err := ioutil.WriteFile(location, body, 0644)
@@ -298,7 +347,7 @@ func writeOutputFile(location string, body []byte) error {
 func extractHeaderKV(header string) (string, string) {
 	splitHeader := strings.Split(header, ":")
 	if len(splitHeader) != 2 {
-		log.Fatalf("Malformed Request Header!\n%v", header)
+		log.Fatalf("[SPOTTER]: Malformed Request Header:\n%v", header)
 	}
 
 	return splitHeader[0], splitHeader[1]
@@ -307,7 +356,7 @@ func extractHeaderKV(header string) (string, string) {
 func createHttpRequest(requestMethod string, requestBody string, requestHeaders headers, url *url.URL) *http.Request {
 	req, err := http.NewRequest(requestMethod, url.String(), createHttpBody(requestBody))
 	if err != nil {
-		log.Fatalf("Couldn't create HTTP Request!\n%v", err)
+		log.Fatalf("[SPOTTER]: Couldn't create HTTP Request:\n%v", err)
 	}
 
 	for _, value := range requestHeaders {
