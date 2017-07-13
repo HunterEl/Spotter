@@ -1,4 +1,8 @@
 # Spotter
+[![GoReportCard][report-badge]][report]
+
+[report-badge]: https://goreportcard.com/badge/github.com/HunterEl/Spotter
+[report]: https://goreportcard.com/report/github.com/HunterEl/Spotter
 Work In Progress.
 
 ## What Exactly Does Spotter Do?
